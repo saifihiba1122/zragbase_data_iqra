@@ -1,21 +1,11 @@
-
-import time
 import streamlit as st
-
-# ==========================================
-# PAGE CONFIGURATION
-# ==========================================
 
 st.set_page_config(
     page_title="Book RAG Assistant",
     page_icon="📚",
-    layout="wide"
+    layout="wide",
 )
 
-
-# ==========================================
-# LOAD RAG SYSTEM
-# ==========================================
 
 @st.cache_resource
 def load_rag():
@@ -23,301 +13,147 @@ def load_rag():
     return rag
 
 
-# ==========================================
-# HELPER FUNCTION
-# ==========================================
-
-def get_snippet(text, limit=250):
-
-    text = text.strip().replace("\n", " ")
-
-    if len(text) <= limit:
-        return text
-
-    return text[:limit].rsplit(" ", 1)[0] + "..."
-
-
-# ==========================================
-# CUSTOM DESIGN
-# ==========================================
-
 st.markdown("""
 <style>
-.main {
-    background-color: #f5f7fb;
-}
-
-.block-container {
-    padding-top: 2rem;
-}
-
-[data-testid="stSidebar"] {
-    background-color: #101827;
-}
-
-[data-testid="stSidebar"] * {
-    color: white;
-}
-
-.stChatMessage {
-    border-radius: 12px;
-}
-
-h1 {
-    color: #155eef;
-}
+.main { background-color: #f5f7fb; }
+.block-container { padding-top: 2rem; }
+[data-testid="stSidebar"] { background-color: #101827; }
+[data-testid="stSidebar"] * { color: white; }
+.stChatMessage { border-radius: 12px; }
+h1 { color: #155eef; }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ==========================================
-# SIDEBAR
-# ==========================================
-
 with st.sidebar:
-
     st.title("📚 Book Assistant")
-
-    st.write("Local RAG-Based Search System")
-
+    st.write("RAG-Based Q&A System")
     st.divider()
-
-    st.success("Local Retrieval Mode")
-
-    st.caption("No API | No Gemini | No API Quota")
-
+    st.success("Gemini + FAISS Pipeline")
+    st.caption("Query → Embed → Search → LLM → Answer")
     st.divider()
-
-    st.caption("Project Technologies")
-
-    st.write("• Python")
+    st.caption("Tech Stack")
     st.write("• Sentence Transformers")
     st.write("• FAISS Vector Database")
+    st.write("• Google Gemini LLM")
     st.write("• Streamlit")
 
     if st.button("Clear Chat", use_container_width=True):
-
         st.session_state.messages = []
-
         st.rerun()
 
-
-# ==========================================
-# MAIN HEADER
-# ==========================================
-
 st.title("📚 Database Book Assistant")
-
-st.write(
-    "Ask questions from Modern Database Management, "
-    "10th Edition."
-)
-
-st.caption(
-    "Retrieval-Augmented Generation (RAG) | Local Search"
-)
-
+st.write("Ask questions from **Modern Database Management, 10th Edition**.")
+st.caption("RAG Pipeline: Query → Embedding → FAISS Search → LLM Generation")
 st.divider()
 
-
-# ==========================================
-# SESSION STATE
-# ==========================================
-
 if "messages" not in st.session_state:
-
     st.session_state.messages = []
 
-
-# ==========================================
-# LOAD MODEL
-# ==========================================
-
 try:
-
     with st.spinner("Loading RAG system..."):
-
         rag = load_rag()
-
     st.success("RAG system ready!")
-
-except Exception as error:
-
-    st.error(f"Unable to load RAG system: {error}")
-
+except Exception as e:
+    st.error(f"Failed to load RAG system: {e}")
     st.stop()
 
 
-# ==========================================
-# DISPLAY CHAT HISTORY
-# ==========================================
+def snippet(text, limit=250):
+    text = text.strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "..."
 
-for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-        st.markdown(message["content"])
-
-        if message.get("sources"):
-
-            with st.expander("View Sources"):
-
-                for source in message["sources"]:
-
-                    st.markdown(
-                        f"**{rag.get_source_label(source)}**"
-                    )
-
-                    st.caption(
-                        f"Distance: {source['distance']:.4f}"
-                    )
-
-                    st.write(
-                        get_snippet(source["text"], 250)
-                    )
-
-                    with st.expander("View Full Passage"):
-
-                        st.write(source["text"])
-
+        if msg.get("sources"):
+            with st.expander("📄 View Sources"):
+                for src in msg["sources"]:
+                    st.markdown(f"**{rag.get_source_label(src)}**")
+                    st.caption(f"Score: {src['final_score']:.3f} | Distance: {src['distance']:.4f}")
+                    st.write(snippet(src["text"]))
                     st.divider()
 
-        if message.get("timing"):
+        if msg.get("timing"):
+            st.caption(msg["timing"])
 
-            st.caption(message["timing"])
-
-
-# ==========================================
-# CHAT INPUT
-# ==========================================
-
-query = st.chat_input(
-    "Ask a question about databases..."
-)
-
+query = st.chat_input("Ask a question about databases...")
 
 if query:
-
-    # ==========================================
-    # USER MESSAGE
-    # ==========================================
-
-    st.session_state.messages.append({
-        "role": "user",
-        "content": query
-    })
+    st.session_state.messages.append({"role": "user", "content": query})
 
     with st.chat_message("user"):
-
         st.markdown(query)
 
-
-    # ==========================================
-    # RETRIEVAL
-    # ==========================================
-
     with st.chat_message("assistant"):
-
-        with st.spinner("Searching your book..."):
-
+        with st.spinner("Processing your question..."):
             try:
+                result = rag.pipeline(query)
 
-                start_time = time.time()
+                if not result["relevant"]:
+                    st.toast("⚠️ This question is outside the book's knowledge base!", icon="⚠️")
+                    answer = (
+                        "**This question is outside the book's knowledge base.**\n\n"
+                        "I can only answer questions related to "
+                        "*Modern Database Management, 10th Edition*. "
+                        "Please ask something about databases, SQL, ER models, "
+                        "normalization, or other topics covered in the book."
+                    )
+                    st.markdown(answer)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                    })
 
-                sources = rag.search_database(query)
+                elif result["llm_error"]:
+                    st.warning(f"LLM Error: {result['llm_error']}")
+                    answer = "⚠️ Could not generate an answer. Showing retrieved sources instead."
+                    st.markdown(answer)
 
-                search_time = time.time() - start_time
-
-
-                # ==========================================
-                # CREATE SHORT RESPONSE
-                # ==========================================
-
-                if not sources:
-
-                    answer = "No relevant information found in the book."
-
-                else:
-
-                    top_sources = sources[:3]
-
-                    answer = "### Retrieved Information\n\n"
-
-                    for source in top_sources:
-
-                        answer += (
-                            f"**{rag.get_source_label(source)}**\n\n"
-                            f"{get_snippet(source['text'], 250)}\n\n"
-                        )
-
-
-                # ==========================================
-                # PERFORMANCE
-                # ==========================================
-
-                total_time = time.time() - start_time
-
-                timing = (
-                    f"Search: {search_time:.2f}s | "
-                    f"Total: {total_time:.2f}s"
-                )
-
-
-                # ==========================================
-                # DISPLAY ANSWER
-                # ==========================================
-
-                st.markdown(answer)
-
-
-                # ==========================================
-                # SOURCES
-                # ==========================================
-
-                if sources:
-
-                    with st.expander("View Sources"):
-
-                        for source in sources[:3]:
-
-                            st.markdown(
-                                f"**{rag.get_source_label(source)}**"
-                            )
-
-                            st.caption(
-                                f"Distance: {source['distance']:.4f}"
-                            )
-
-                            st.write(
-                                get_snippet(source["text"], 250)
-                            )
-
-                            with st.expander("View Full Passage"):
-
-                                st.write(source["text"])
-
+                    with st.expander("📄 Retrieved Sources"):
+                        for src in result["chunks"][:5]:
+                            st.markdown(f"**{rag.get_source_label(src)}**")
+                            st.write(snippet(src["text"]))
                             st.divider()
 
+                    timing = f"Search: {result['timing']['search']:.2f}s | Total: {result['timing']['total']:.2f}s"
+                    st.caption(timing)
 
-                # ==========================================
-                # TIMING
-                # ==========================================
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": result["chunks"][:5],
+                        "timing": timing,
+                    })
 
-                st.caption(timing)
+                else:
+                    st.markdown(result["answer"])
 
+                    with st.expander("📄 View Sources"):
+                        for src in result["chunks"][:5]:
+                            st.markdown(f"**{rag.get_source_label(src)}**")
+                            st.caption(f"Score: {src['final_score']:.3f} | Distance: {src['distance']:.4f}")
+                            st.write(snippet(src["text"]))
+                            st.divider()
 
-                # ==========================================
-                # SAVE HISTORY
-                # ==========================================
+                    t = result["timing"]
+                    timing = (
+                        f"Embed: {t['embed']:.2f}s | "
+                        f"Search: {t['search']:.2f}s | "
+                        f"LLM: {t['llm']:.2f}s | "
+                        f"Total: {t['total']:.2f}s"
+                    )
+                    st.caption(timing)
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": sources[:3],
-                    "timing": timing
-                })
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": result["answer"],
+                        "sources": result["chunks"][:5],
+                        "timing": timing,
+                    })
 
-
-            except Exception as error:
-
-                st.error(f"Error: {error}")
+            except Exception as e:
+                st.error(f"Error: {e}")

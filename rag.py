@@ -1,402 +1,219 @@
-
-import time
 import json
-import os
 import re
-from pathlib import Path
+import time
 
 import numpy as np
 import faiss
-
 from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-load_dotenv()
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+import config
 
-BASE_DIR = Path(r"E:\rag_base")
-
-INDEX_FILE = BASE_DIR / "data" / "faiss.index"
-METADATA_FILE = BASE_DIR / "data" / "faiss_metadata.json"
-
-MODEL_NAME = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-3.6-flash"
-
-TOP_K = 10
-
-
-# ==========================================
-# LOAD FAISS
-# ==========================================
-
+# Load resources once at import
 print("Loading FAISS index...")
-
-index = faiss.read_index(str(INDEX_FILE))
-
-print("FAISS loaded:", index.ntotal)
-
-
-# ==========================================
-# LOAD METADATA
-# ==========================================
+index = faiss.read_index(str(config.INDEX_FILE))
+print(f"FAISS loaded: {index.ntotal} vectors")
 
 print("Loading metadata...")
-
-with open(METADATA_FILE, "r", encoding="utf-8") as file:
-    metadata = json.load(file)
-
-print("Metadata loaded:", len(metadata))
-
-
-# ==========================================
-# LOAD EMBEDDING MODEL
-# ==========================================
+with open(config.METADATA_FILE, "r", encoding="utf-8") as f:
+    metadata = json.load(f)
+print(f"Metadata loaded: {len(metadata)} records")
 
 print("Loading embedding model...")
+embedder = SentenceTransformer(config.EMBEDDING_MODEL)
+print("Embedding model ready!")
 
-model = SentenceTransformer(MODEL_NAME)
-
-print("Embedding model loaded!")
-
-
-# ==========================================
-# CONNECT GEMINI
-# ==========================================
-
-api_key = os.getenv("GEMINI_API_KEY")
-
-client = None
-
-if api_key:
-
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=15000)
+gemini_client = None
+if config.GEMINI_API_KEY and config.GEMINI_API_KEY != "YOUR_API_KEY_HERE":
+    gemini_client = genai.Client(
+        api_key=config.GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=30000),
     )
-
-    print("Gemini client initialized!")
-
+    print("Gemini client connected!")
 else:
-    print("WARNING: GEMINI_API_KEY not found. Retrieval mode is available.")
+    print("WARNING: GEMINI_API_KEY not set. LLM generation disabled.")
+
+STOP_WORDS = {
+    "what", "is", "are", "the", "a", "an", "of", "in",
+    "on", "to", "for", "and", "explain", "define",
+    "describe", "how", "which", "why", "does", "do",
+    "can", "this", "that", "it", "with", "from", "by",
+}
 
 
-# ==========================================
-# HYBRID SEARCH
-# ==========================================
+def embed_query(query: str) -> np.ndarray:
+    vector = embedder.encode(query, convert_to_numpy=True)
+    return np.asarray([vector], dtype=np.float32)
 
-def search_database(query, top_k=TOP_K):
 
-    # STEP 1: Semantic search
+def search_faiss(query_vector: np.ndarray, top_k: int = config.TOP_K):
+    candidate_k = min(max(top_k * 5, 50), index.ntotal)
+    distances, indices = index.search(query_vector, candidate_k)
+    return distances[0], indices[0]
 
-    query_vector = model.encode(
-        query,
-        convert_to_numpy=True
-    )
 
-    query_vector = np.asarray(
-        [query_vector],
-        dtype=np.float32
-    )
-
-    actual_k = min(max(top_k * 5, 50), index.ntotal)
-
-    distances, indices = index.search(
-        query_vector,
-        actual_k
-    )
-
-    # STEP 2: Extract query keywords
-
-    stop_words = {
-        "what", "is", "are", "the", "a", "an",
-        "of", "in", "on", "to", "for", "and",
-        "explain", "define", "describe", "how"
-    }
-
-    query_words = set(
-        re.findall(r"\b\w+\b", query.lower())
-    ) - stop_words
+def rank_chunks(query: str, distances, indices, top_k: int = config.TOP_K):
+    query_words = set(re.findall(r"\b\w+\b", query.lower())) - STOP_WORDS
 
     results = []
-
-    # STEP 3: Keyword scoring
-
-    for semantic_rank, idx in enumerate(indices[0]):
-
+    for rank, idx in enumerate(indices):
         if idx < 0 or idx >= len(metadata):
             continue
 
         record = metadata[idx]
+        text = record.get("text", "")
+        doc_words = set(re.findall(r"\b\w+\b", text.lower()))
 
-        text_content = record.get("text", "")
-
-        document_words = set(
-            re.findall(r"\b\w+\b", text_content.lower())
-        )
-
+        keyword_score = 0.0
         if query_words:
+            keyword_score = len(query_words & doc_words) / len(query_words)
 
-            matched_words = query_words.intersection(
-                document_words
-            )
-
-            keyword_score = (
-                len(matched_words) / len(query_words)
-            )
-
-        else:
-            keyword_score = 0.0
-
-        # STEP 4: Combined ranking
-
-        semantic_score = 1 / (semantic_rank + 1)
-
-        final_score = (
-            0.65 * semantic_score
-            + 0.35 * keyword_score
-        )
+        semantic_score = 1 / (rank + 1)
+        final_score = 0.65 * semantic_score + 0.35 * keyword_score
 
         results.append({
-
             "chunk_id": record.get("chunk_id", idx),
-
-            "distance": float(
-                distances[0][semantic_rank]
-            ),
-
+            "distance": float(distances[rank]),
             "keyword_score": keyword_score,
-
             "final_score": final_score,
-
-            "text": text_content,
-
-            "metadata": record.get("metadata", {})
-
+            "text": text,
+            "metadata": record.get("metadata", {}),
         })
 
-    # STEP 5: Sort results
-
-    results.sort(
-        key=lambda item: item["final_score"],
-        reverse=True
-    )
-
-    # STEP 6: Final ranking
-
-    results = results[:top_k]
-
-    for rank, result in enumerate(results):
-
-        result["rank"] = rank + 1
-
-    return results
+    results.sort(key=lambda r: r["final_score"], reverse=True)
+    for i, r in enumerate(results[:top_k]):
+        r["rank"] = i + 1
+    return results[:top_k]
 
 
-# ==========================================
-# SOURCE INFORMATION
-# ==========================================
-
-def get_source_label(source):
-
-    info = source.get("metadata", {})
-
-    page = (
-        info.get("page")
-        or info.get("page_number")
-        or info.get("page_num")
-    )
-
-    if page is not None:
-
-        return (
-            f"Chunk {source['chunk_id']} | Page {page}"
-        )
-
-    return f"Chunk {source['chunk_id']}"
-
-
-# ==========================================
-# GEMINI GENERATION
-# ==========================================
-
-def ask_gemini(prompt):
-
-    if client is None:
-
-        return None, "GEMINI_API_KEY is not configured."
-
-    try:
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-
-        if not response.text:
-
-            return None, "Gemini returned an empty response."
-
-        return response.text, None
-
-    except Exception as error:
-
-        return None, str(error)
-
-
-# ==========================================
-# RAG ANSWER
-# ==========================================
-
-def generate_answer(query):
-
-    start_time = time.time()
-
-    print("\nSearching book...")
-
-    search_start = time.time()
-
-    results = search_database(query)
-
-    search_time = time.time() - search_start
-
+def is_relevant(results: list) -> bool:
     if not results:
+        return False
+    return results[0]["distance"] < config.RELEVANCE_THRESHOLD
 
-        return "No relevant information found.", []
 
-    # PREPARE CONTEXT
+def get_source_label(source: dict) -> str:
+    info = source.get("metadata", {})
+    page = info.get("page") or info.get("page_number") or info.get("page_num")
+    label = f"Chunk {source['chunk_id']}"
+    if page is not None:
+        label += f" | Page {page}"
+    return label
+
+
+def generate_with_llm(query: str, chunks: list) -> tuple[str, str | None]:
+    if gemini_client is None:
+        return "", "GEMINI_API_KEY is not configured. Set it in .env file."
 
     context = ""
+    for chunk in chunks:
+        label = get_source_label(chunk)
+        context += f"\n\n[{label}]\n{chunk['text']}"
 
-    for result in results:
+    prompt = f"""You are a helpful book assistant for "Modern Database Management, 10th Edition".
 
-        context += (
-            f"\n\n[{get_source_label(result)}]\n"
-            f"{result['text']}"
-        )
-
-    # PROMPT
-
-    prompt = f"""
-You are an educational book assistant.
-
-Answer the question using ONLY the provided
-book context.
+Answer the question using ONLY the provided book context below.
 
 Rules:
-1. Explain in simple and clear language.
-2. Do not invent information.
-3. If context is insufficient, say so.
-4. Mention source chunk IDs where relevant.
-5. Never invent page numbers.
+1. Give a clear, well-structured answer.
+2. Do NOT invent any information beyond what the context provides.
+3. If the context is insufficient, say so honestly.
+4. Reference chunk IDs when relevant.
 
 BOOK CONTEXT:
-
 {context}
 
-USER QUESTION:
+QUESTION:
+{query}"""
 
-{query}
-"""
-
-    # GENERATE ANSWER
-
-    print("Generating answer with Gemini...")
-
-    api_start = time.time()
-
-    answer, api_error = ask_gemini(prompt)
-
-    api_time = time.time() - api_start
-
-    total_time = time.time() - start_time
-
-    # PERFORMANCE REPORT
-
-    print("\n===================================")
-    print("PERFORMANCE REPORT")
-    print("===================================")
-
-    print(f"Search Time : {search_time:.2f} seconds")
-    print(f"Gemini Time : {api_time:.2f} seconds")
-    print(f"Total Time  : {total_time:.2f} seconds")
-
-    if api_error:
-
-        answer = (
-            "Gemini API Error:\n"
-            + api_error
-            + "\n\nRetrieved sources are shown below."
-        )
-
-    return answer, results
-
-
-# ==========================================
-# INTERACTIVE CHAT
-# ==========================================
-
-def run_chat():
-
-    print("\n===================================")
-    print("DATABASE BOOK RAG SYSTEM")
-    print("===================================")
-
-    print("Ask questions from your database book.")
-    print("Type 'exit' to close.")
-
-    while True:
-
-        query = input("\nYour Question: ").strip()
-
-        if query.lower() == "exit":
-
-            print("RAG system closed.")
-            break
-
-        if not query:
-
-            print("Please enter a question.")
-            continue
-
+    for attempt in range(3):
         try:
-
-            answer, sources = generate_answer(query)
-
-            print("\n===================================")
-            print("AI ANSWER")
-            print("===================================")
-
-            print(answer)
-
-            print("\n===================================")
-            print("RETRIEVED SOURCES")
-            print("===================================")
-
-            for source in sources:
-
-                print(
-                    f"\n{get_source_label(source)} | "
-                    f"Distance: {source['distance']:.4f} | "
-                    f"Keyword Score: {source['keyword_score']:.2f}"
-                )
-
-                print(source["text"][:400])
-
-                print("-" * 50)
-
-        except Exception as error:
-
-            print("\nError:", error)
+            response = gemini_client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=prompt,
+            )
+            if not response.text:
+                return "", "Gemini returned an empty response."
+            return response.text, None
+        except Exception as e:
+            error_str = str(e)
+            if ("503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            return "", error_str
 
 
-# ==========================================
-# MAIN
-# ==========================================
+def pipeline(query: str) -> dict:
+    start = time.time()
+
+    query_vector = embed_query(query)
+    embed_time = time.time() - start
+
+    t = time.time()
+    distances, indices = search_faiss(query_vector)
+    search_time = time.time() - t
+
+    t = time.time()
+    chunks = rank_chunks(query, distances, indices)
+    rank_time = time.time() - t
+
+    relevant = is_relevant(chunks)
+
+    answer = ""
+    llm_error = None
+    llm_time = 0.0
+
+    if relevant:
+        t = time.time()
+        answer, llm_error = generate_with_llm(query, chunks[:5])
+        llm_time = time.time() - t
+
+    total_time = time.time() - start
+
+    return {
+        "query": query,
+        "answer": answer,
+        "chunks": chunks,
+        "relevant": relevant,
+        "llm_error": llm_error,
+        "timing": {
+            "embed": embed_time,
+            "search": search_time,
+            "rank": rank_time,
+            "llm": llm_time,
+            "total": total_time,
+        },
+    }
+
+
+def search_database(query: str, top_k: int = config.TOP_K) -> list:
+    query_vector = embed_query(query)
+    distances, indices = search_faiss(query_vector, top_k)
+    return rank_chunks(query, distances, indices, top_k)
+
 
 if __name__ == "__main__":
+    print("\nDATABASE BOOK RAG SYSTEM")
+    print("Type 'exit' to close.\n")
 
-    run_chat()
+    while True:
+        query = input("Your Question: ").strip()
+        if query.lower() == "exit":
+            break
+        if not query:
+            continue
+
+        result = pipeline(query)
+
+        if not result["relevant"]:
+            print("\nThis question is outside the book's knowledge base.\n")
+            continue
+
+        if result["llm_error"]:
+            print(f"\nLLM Error: {result['llm_error']}\n")
+        else:
+            print(f"\n{result['answer']}\n")
+
+        t = result["timing"]
+        print(f"[Embed: {t['embed']:.2f}s | Search: {t['search']:.2f}s | LLM: {t['llm']:.2f}s | Total: {t['total']:.2f}s]")
