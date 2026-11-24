@@ -4,11 +4,6 @@ __pycache__/
 *.pyo
 venv/
 
-# Generated data (large files)
-data/*.json
-data/*.index
-data/*.pdf
-*.pdf
 
 .streamlit/
 .vscode/
